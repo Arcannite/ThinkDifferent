@@ -1,0 +1,1001 @@
+#!/usr/bin/env python3
+"""bench — multi-benchmark runner CLI (Terminal-Bench 4.0, DeepSWE v1.1, GDPval-AA).
+
+Stdlib + PyYAML only. All model/provider knowledge comes from config/models.yaml and
+config/providers.yaml; benchmark behaviour comes from benchmarks/<name>/benchmark.yaml.
+Nothing here should need a new `case` arm to add a model or a benchmark.
+
+Subcommands: render | doctor | run | score | list
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+try:
+    import yaml
+except ImportError:  # pragma: no cover
+    sys.exit("bench: PyYAML is required (apt install python3-yaml)")
+
+ROOT = Path(__file__).resolve().parent.parent
+CONFIG = ROOT / "config"
+RUNS = ROOT / "runs"
+LOGS = ROOT / "logs"
+ENV_FILE = ROOT / ".env"
+
+STUB_VALUES = {"", "REPLACE_ME"}
+
+
+# --------------------------------------------------------------------------- utils
+
+
+def die(msg: str, code: int = 2) -> "NoReturn":
+    print(f"bench: {msg}", file=sys.stderr)
+    raise SystemExit(code)
+
+
+def load_yaml(path: Path) -> dict:
+    if not path.is_file():
+        die(f"missing config file: {path}")
+    with path.open() as fh:
+        return yaml.safe_load(fh) or {}
+
+
+def write_json(path: Path, obj: dict, mode: int | None = None) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with tmp.open("w") as fh:
+        json.dump(obj, fh, indent=2, sort_keys=False)
+        fh.write("\n")
+    if mode is not None:
+        os.chmod(tmp, mode)
+    tmp.replace(path)
+
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def read_env_file() -> dict[str, str]:
+    """Parse .env without exporting anything. Values never get printed."""
+    out: dict[str, str] = {}
+    if not ENV_FILE.is_file():
+        return out
+    for raw in ENV_FILE.read_text().splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, val = line.partition("=")
+        out[key.strip()] = val.strip().strip("'\"")
+    return out
+
+
+def providers() -> dict:
+    return (load_yaml(CONFIG / "providers.yaml").get("providers") or {})
+
+
+def models() -> dict:
+    return (load_yaml(CONFIG / "models.yaml").get("models") or {})
+
+
+def resolve_model(key: str) -> tuple[str, dict]:
+    """Resolve a model key or alias to (canonical_key, entry)."""
+    ms = models()
+    if key in ms:
+        return key, ms[key]
+    for name, entry in ms.items():
+        if key in (entry.get("aliases") or []):
+            return name, entry
+    known = ", ".join(sorted(ms))
+    die(f"unknown model {key!r}; config/models.yaml defines: {known}")
+    raise AssertionError  # unreachable
+
+
+def benchmark_names() -> list[str]:
+    return list(load_yaml(CONFIG / "benchmarks.yaml").get("benchmarks") or [])
+
+
+def load_benchmark(name: str) -> dict:
+    if name not in benchmark_names():
+        die(f"benchmark {name!r} not in config/benchmarks.yaml ({', '.join(benchmark_names())})")
+    path = ROOT / "benchmarks" / name / "benchmark.yaml"
+    if not path.is_file():
+        die(f"missing benchmark manifest: {path}")
+    cfg = load_yaml(path)
+    if cfg.get("name") != name:
+        die(f"{path}: name field {cfg.get('name')!r} != directory {name!r}")
+    return cfg
+
+
+def dataset_dir(cfg: dict) -> Path:
+    return ROOT / (cfg.get("dataset") or {}).get("path", f"datasets/{cfg['name']}")
+
+
+def task_dirs(cfg: dict) -> list[str]:
+    d = dataset_dir(cfg) / "tasks"
+    if not d.is_dir():
+        return []
+    return sorted(p.parent.name for p in d.glob("*/task.toml"))
+
+
+def dataset_ref(cfg: dict) -> str:
+    name = cfg["name"]
+    rev = ROOT / f"datasets/{name}.REVISION"
+    if rev.is_file() and rev.read_text().strip():
+        return rev.read_text().strip()
+    return str((cfg.get("dataset") or {}).get("ref") or "")
+
+
+def host_config() -> dict:
+    hosts = sorted((CONFIG / "hosts").glob("*.yaml"))
+    if not hosts:
+        return {}
+    return load_yaml(hosts[0])
+
+
+def disk_free_mb(path: str | Path) -> int:
+    """Free MiB on the filesystem holding `path`; -1 when it cannot be read.
+
+    The host config's `capacity.disk_mb` is a measurement, not a live number, so run
+    decisions use this instead.
+    """
+    p = Path(path)
+    while not p.exists() and p != p.parent:
+        p = p.parent
+    try:
+        return int(shutil.disk_usage(p).free // (1024 * 1024))
+    except OSError:
+        return -1
+
+
+def disk_reserve_mb(hc: dict) -> int:
+    return int(((hc.get("limits") or {}).get("disk_reserve_gb", 100)) * 1024)
+
+
+def docker_root(hc: dict) -> str:
+    return str(((hc.get("paths") or {}).get("docker_root") or "/"))
+
+
+def bundle_versions() -> dict[str, str]:
+    out: dict[str, str] = {}
+    f = ROOT / "harness/bundle/VERSIONS"
+    if f.is_file():
+        for line in f.read_text().splitlines():
+            if "=" in line:
+                k, _, v = line.partition("=")
+                out[k.strip()] = v.strip()
+    return out
+
+
+# --------------------------------------------------------------------------- render
+
+
+def render_models() -> dict:
+    """Build the models.json payload from config/models.yaml + providers.yaml.
+
+    A built-in provider already ships its endpoint, auth and catalog in pi; redeclaring
+    baseUrl/api/apiKey would pin or override it. Only `models` is emitted for those, which
+    pi merges into the catalog by model id. Non-builtin providers are fully declared.
+    """
+    provs = providers()
+    payload: dict = {
+        "$schema": "https://pi.dev/schemas/models.schema.json",
+        "providers": {},
+    }
+    for key, m in models().items():
+        pname = m["provider"]
+        if pname not in provs:
+            die(f"model {key!r} references unknown provider {pname!r} in config/providers.yaml")
+        p = provs[pname]
+        decl = payload["providers"].setdefault(pname, {})
+        if not p.get("builtin", False):
+            decl["name"] = p.get("name", pname)
+            decl["baseUrl"] = p["base_url"]
+            decl["api"] = p["api"]
+            decl.setdefault("apiKey", f"${p['auth_env']}")
+        cost = m.get("cost") or {}
+        decl.setdefault("models", []).append(
+            {
+                "id": m["id"],
+                "name": key,
+                "reasoning": bool(m.get("reasoning", False)),
+                "contextWindow": int(m.get("context", 128000)),
+                "maxTokens": int(m.get("max_tokens", 16384)),
+                "cost": {
+                    "input": float(cost.get("input", 0)),
+                    "output": float(cost.get("output", 0)),
+                    "cacheRead": float(cost.get("cache_read", 0)),
+                    "cacheWrite": float(cost.get("cache_write", 0)),
+                },
+            }
+        )
+    return payload
+
+
+def cmd_render(_args) -> int:
+    payload = render_models()
+    targets = [
+        ROOT / "harness/bundle/models.json",
+        Path.home() / ".pi/agent/models.json",
+    ]
+    for t in targets:
+        write_json(t, payload, mode=0o600)
+        n = sum(len(v.get("models", [])) for v in payload["providers"].values())
+        print(f"rendered {t}  ({len(payload['providers'])} declared providers, {n} models)")
+    builtin = sorted(
+        {m["provider"] for m in models().values() if providers()[m["provider"]].get("builtin")}
+    )
+    if builtin:
+        print(f"builtin (endpoint/auth from pi's catalog, models overlaid): {', '.join(builtin)}")
+    return 0
+
+
+# --------------------------------------------------------------------------- doctor
+
+
+class Report:
+    def __init__(self) -> None:
+        self.rows: list[tuple[str, str, str]] = []
+
+    def add(self, check: str, status: str, detail: str = "") -> None:
+        self.rows.append((check, status, detail))
+
+    def has(self, *statuses: str) -> bool:
+        return any(s in statuses for _, s, _ in self.rows)
+
+    def print(self) -> None:
+        w = max((len(c) for c, _, _ in self.rows), default=10)
+        for check, status, detail in self.rows:
+            print(f"{check:<{w}}  {status:<7}  {detail}")
+
+
+def _run(cmd: list[str], timeout: int = 30) -> tuple[int, str]:
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return p.returncode, (p.stdout + p.stderr).strip()
+    except FileNotFoundError:
+        return 127, "not found"
+    except subprocess.TimeoutExpired:
+        return 124, "timeout"
+
+
+def doctor_report(full_bundle: bool = False, bench: dict | None = None) -> Report:
+    r = Report()
+
+    # --- docker
+    rc, out = _run(["docker", "info", "--format",
+                    "{{.ServerVersion}} {{.Driver}} {{.DockerRootDir}}"])
+    if rc == 0:
+        ver, driver, droot = (out.split() + ["", "", ""])[:3]
+        r.add("docker", "OK", f"server {ver}, driver {driver}, root {droot}")
+        rc2, out2 = _run(["docker", "run", "--rm", "hello-world"], timeout=180)
+        r.add("docker run", "OK" if rc2 == 0 else "FAIL",
+              "hello-world" if rc2 == 0 else out2.splitlines()[-1][:90] if out2 else "failed")
+    else:
+        r.add("docker", "FAIL", out.splitlines()[-1][:90] if out else "unavailable")
+
+    # --- python / uv / git
+    py = sys.version_info
+    r.add("python", "OK" if py >= (3, 12) else "FAIL", f"{py.major}.{py.minor}.{py.micro}")
+    rc, out = _run(["uv", "--version"])
+    r.add("uv", "OK" if rc == 0 else "FAIL", out.splitlines()[0] if out else "missing")
+    rc, out = _run(["git", "--version"])
+    r.add("git", "OK" if rc == 0 else "FAIL", out.splitlines()[0] if out else "missing")
+
+    # --- engines
+    for eng, cmd in (("harbor", ["harbor", "--version"]), ("pier", ["pier", "--version"])):
+        rc, out = _run(cmd)
+        r.add(eng, "OK" if rc == 0 else "FAIL", out.splitlines()[0][:60] if out else "missing")
+
+    # --- pi on host (informational; containers use the bundle)
+    rc, out = _run(["bash", "-lc", "command -v pi >/dev/null && pi --version"])
+    r.add("pi (host)", "OK" if rc == 0 else "WARN", out.splitlines()[0] if out else "not on PATH")
+
+    # --- host disk (live; capacity.disk_mb in the host config is only a measurement)
+    hc = host_config()
+    if hc:
+        free = disk_free_mb(docker_root(hc))
+        reserve = disk_reserve_mb(hc)
+        if free < 0:
+            r.add("host disk", "WARN", "cannot stat " + docker_root(hc))
+        else:
+            status = "OK" if free >= reserve else "WARN"
+            detail = (f"{hc.get('name', 'host')}: {free / 1024:.0f} GiB free on "
+                      f"{docker_root(hc)}, reserve {reserve / 1024:.0f} GiB")
+            if free < reserve:
+                detail += " — prune before a sweep (disk_policy: " \
+                          f"{hc.get('disk_policy', 'unset')})"
+            r.add("host disk", status, detail)
+
+    # --- bundle
+    b = ROOT / "harness/bundle"
+    required = ["install.sh", "settings.json", "node-linux-x64.tar.gz", "pi-agent.tar.gz"]
+    missing = [f for f in required if not (b / f).is_file()]
+    if missing:
+        r.add("bundle", "FAIL", "missing: " + ", ".join(missing))
+    else:
+        v = bundle_versions()
+        detail = ", ".join(f"{k} {v[k]}" for k in ("node", "pi", "uv") if k in v) \
+                 or f"{len(required)} required files present"
+        r.add("bundle", "OK", detail)
+        if full_bundle:
+            rc, out = _run(["bash", str(ROOT / "scripts/verify-bundle.sh"), str(b)], timeout=900)
+            r.add("bundle verify", "OK" if rc == 0 else "FAIL",
+                  (out.splitlines()[-1][:80] if out else ""))
+
+    # --- adapters (registry.py is required by every harness; the rest are per-engine)
+    adir = ROOT / "harness/adapters"
+    missing = [f for f in ("registry.py", "harbor_pi.py") if not (adir / f).is_file()]
+    r.add("adapters", "OK" if not missing else "FAIL",
+          "registry.py + harbor_pi.py" if not missing else "missing: " + ", ".join(missing))
+    for optional, note in (("pier_pi.py", "stage 2 (pier runs mini-swe-agent)"),
+                           ("host_pi.py", "gdpval-aa scaffold"),
+                           ("core.py", "shared refactor, not needed")):
+        if not (adir / optional).is_file():
+            r.add(f"adapters:{optional}", "WARN", note)
+
+    # --- datasets
+    for name in benchmark_names():
+        cfg = load_benchmark(name)
+        if not cfg.get("enabled", False):
+            r.add(f"dataset {name}", "WARN", "disabled")
+            continue
+        d = dataset_dir(cfg)
+        n = len(task_dirs(cfg))
+        want = int(cfg.get("task_count", 0))
+        if n == 0:
+            r.add(f"dataset {name}", "FAIL", f"no tasks at {d}/tasks (user-supplied, ASK-3)")
+        elif want and n != want:
+            r.add(f"dataset {name}", "FAIL", f"{n} tasks, manifest says {want}")
+        else:
+            r.add(f"dataset {name}", "OK", f"{n} tasks")
+
+    # --- credentials (names only)
+    env = read_env_file()
+    provs = providers()
+    used = {m["provider"] for m in models().values()}
+    for pname in sorted(used):
+        aenv = provs[pname].get("auth_env")
+        if not aenv:
+            continue
+        val = env.get(aenv, os.environ.get(aenv, ""))
+        if val in STUB_VALUES:
+            r.add(f"key {aenv}", "MISSING", f"for provider {pname} (ASK-2)")
+        else:
+            r.add(f"key {aenv}", "OK", f"set for provider {pname}")
+    return r
+
+
+def cmd_doctor(args) -> int:
+    r = doctor_report(full_bundle=args.full)
+    r.print()
+    if r.has("FAIL"):
+        print("\nDOCTOR: FAIL (hard failures above)")
+        return 2
+    if r.has("MISSING"):
+        print("\nDOCTOR: credentials missing (ASK-2) — everything else OK")
+        return 1
+    print("\nDOCTOR: OK")
+    return 0
+
+
+# --------------------------------------------------------------------------- list
+
+
+def cmd_list(_args) -> int:
+    print(f"{'benchmark':<18}{'engine':<9}{'enabled':<9}{'tasks':<8}{'manifest':<10}dataset")
+    for name in benchmark_names():
+        cfg = load_benchmark(name)
+        n = len(task_dirs(cfg))
+        print(
+            f"{name:<18}{cfg.get('engine', '?'):<9}"
+            f"{('yes' if cfg.get('enabled') else 'no'):<9}"
+            f"{n:<8}{cfg.get('task_count', 0):<8}{dataset_dir(cfg)}"
+        )
+    return 0
+
+
+# --------------------------------------------------------------------------- run
+
+
+def parse_tasks(spec: str, cfg: dict, n: int | None, seed: int) -> list[str]:
+    available = task_dirs(cfg)
+    if not available:
+        die(f"{cfg['name']}: dataset has no tasks at {dataset_dir(cfg)}/tasks (ASK-3)")
+    spec = spec.strip()
+    if spec.startswith("random:"):
+        try:
+            k = int(spec.split(":", 1)[1])
+        except ValueError:
+            die(f"bad random spec {spec!r}; expected random:N")
+        if n is not None:
+            k = min(k, n)
+        import random
+
+        return sorted(random.Random(seed).sample(available, min(k, len(available))))
+    if spec == "all":
+        die("refusing --tasks all: full sweeps are a user decision (runbook rule 4)")
+    names = [s.strip() for s in spec.split(",") if s.strip()]
+    if n is not None:
+        names = names[:n]
+    unknown = [x for x in names if x not in available]
+    if unknown:
+        die(f"{cfg['name']}: unknown task(s): {', '.join(unknown)}")
+    return names
+
+
+def trial_dir(bench: str, model_key: str, harness: str, task: str) -> Path:
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    d = RUNS / bench / model_key / f"{harness}__{task}__{ts}"
+    if d.exists():
+        d = d.with_name(d.name + f"-{os.getpid()}")
+    return d
+
+
+def trial_env(provider: str, api_key: str, extra: dict[str, str] | None = None) -> dict[str, str]:
+    """Deliberately minimal: no inherited secrets, only the selected provider's key."""
+    keep = ["PATH", "HOME", "LANG", "LC_ALL", "TERM", "TMPDIR"]
+    env = {k: os.environ[k] for k in keep if k in os.environ}
+    env.setdefault("PATH", "/usr/local/bin:/usr/bin:/bin")
+    env["PI_OFFLINE"] = "1"
+    # The harbor adapter is imported by the engine process, which needs to find
+    # harness.adapters and config/*.yaml.
+    env["PYTHONPATH"] = str(ROOT)
+    env["BENCH_ROOT"] = str(ROOT)
+    auth_env = (providers().get(provider) or {}).get("auth_env")
+    if auth_env and api_key:
+        env[auth_env] = api_key
+    if extra:
+        env.update(extra)
+    return env
+
+
+def bundle_dir() -> Path:
+    return ROOT / "harness" / "bundle"
+
+
+def bundle_mounts() -> str:
+    """harbor --mounts: expose the offline bundle read-only inside the task container."""
+    return json.dumps([
+        {
+            "type": "bind",
+            "source": str(bundle_dir()),
+            "target": "/opt/pi-bundle",
+            "read_only": True,
+        }
+    ])
+
+
+def engine_command(cfg: dict, harness: str, model_key: str, model: dict,
+                   task: str, outdir: Path, agent_kwargs: list[str] | None = None) -> list[str]:
+    provider = model["provider"]
+    engine = cfg.get("engine")
+    tasks_path = dataset_dir(cfg) / "tasks"
+    import_path = (cfg.get("agent") or {}).get("import_path", "")
+
+    if engine == "harbor":
+        cmd = ["harbor", "run", "-p", str(tasks_path), "-i", task,
+               "-o", str(outdir), "-k", "1", "-n", "1", "-y", "-q"]
+        if harness == "oracle":
+            cmd += ["-a", "oracle"]
+        elif harness == "pi":
+            cmd += ["-a", import_path, "-m", f"{provider}/{model['id']}",
+                    "--mounts", bundle_mounts()]
+        elif harness == "pi-builtin":
+            # harbor's stock pi: installs from npm at build time and forwards keys only
+            # for its hardcoded provider list. Kept for comparison, not for our registry.
+            cmd += ["-a", "pi", "-m", f"{provider}/{model['id']}"]
+        else:
+            die(f"{cfg['name']}: harness {harness!r} is not available on harbor")
+        for kv in agent_kwargs or []:
+            cmd += ["--ak", kv]
+        return cmd
+
+    if engine == "pier":
+        cmd = ["pier", "run", "-p", str(tasks_path),
+               "--include-task-name", task, "--jobs-dir", str(outdir)]
+        if harness == "oracle":
+            cmd += ["-a", "oracle"]
+        elif harness == "mini-swe-agent":
+            target, _ = litellm_target(provider, model["id"])
+            cmd += ["-a", "mini-swe-agent", "--model", target]
+        elif harness == "pi":
+            die("pier ships no pi agent (`pier_pi.py` is stage-2 work, not in this repo); "
+                "use --harness mini-swe-agent for DeepSWE")
+        else:
+            die(f"{cfg['name']}: harness {harness!r} is not available on pier")
+        for kv in agent_kwargs or []:
+            cmd += ["--ak", kv]
+        return cmd
+
+    if engine == "host":
+        return [sys.executable, "-m", import_path.split(":")[0],
+                "--task", task, "--out", str(outdir)]
+
+    die(f"{cfg['name']}: unknown engine {engine!r} (expected harbor|pier|host)")
+    raise AssertionError  # unreachable
+
+
+def litellm_target(provider: str, model_id: str) -> tuple[str, dict[str, str]]:
+    """Same mapping the adapter uses: providers.yaml -> litellm model string + env."""
+    p = providers()[provider]
+    cfg = p.get("litellm") or {}
+    prefix = cfg.get("prefix")
+    if not prefix:
+        die(f"provider {provider!r} has no litellm.prefix in config/providers.yaml")
+    env: dict[str, str] = {}
+    key = p.get("auth_env")
+    if key and os.environ.get(key):
+        env[cfg.get("api_key_env", "OPENAI_API_KEY")] = os.environ[key]
+    if p.get("base_url"):
+        env[cfg.get("base_url_env", "OPENAI_API_BASE")] = p["base_url"]
+    return f"{prefix}/{model_id}", env
+
+
+def collect_reward(outdir: Path) -> tuple[float | None, dict | None]:
+    for p in sorted(outdir.rglob("reward.json")):
+        try:
+            data = json.loads(p.read_text())
+        except (json.JSONDecodeError, OSError):
+            continue
+        for k in ("reward", "score", "binary_reward", "accuracy"):
+            if isinstance(data.get(k), (int, float)):
+                return float(data[k]), data
+        # DeepSWE style: {"tests": [...], ...} — fall back to any scalar reward-ish key
+        vals = [v for kk, v in data.items() if "reward" in kk.lower() and isinstance(v, (int, float))]
+        if vals:
+            return float(vals[0]), data
+        return None, data
+    for p in sorted(outdir.rglob("reward.txt")):
+        try:
+            txt = p.read_text().strip()
+        except OSError:
+            continue
+        m = re.search(r"-?\d+(?:\.\d+)?", txt)
+        if m:
+            return float(m.group(0)), {"raw": txt}
+    return None, None
+
+
+def _load_json(p: Path) -> object | None:
+    try:
+        if p.stat().st_size > 64 * 1024 * 1024:
+            return None
+        return json.loads(p.read_text())
+    except (json.JSONDecodeError, OSError, UnicodeDecodeError):
+        return None
+
+
+def _sum_usage_blocks(data: object) -> dict[str, float]:
+    """Sum per-turn `usage` blocks (fallback when no n_* totals exist)."""
+    total: dict[str, float] = {}
+
+    def walk(node: object) -> None:
+        if isinstance(node, dict):
+            usage = node.get("usage")
+            if isinstance(usage, dict):
+                for k, v in usage.items():
+                    if isinstance(v, (int, float)) and "token" in k:
+                        total[k] = total.get(k, 0) + v
+            for v in node.values():
+                walk(v)
+        elif isinstance(node, list):
+            for v in node:
+                walk(v)
+
+    walk(data)
+    return total
+
+
+def collect_usage(outdir: Path) -> dict | None:
+    """Token totals for one trial.
+
+    Preference order:
+      1. harbor/pier's canonical counters (`n_input_tokens`, `n_cache_tokens`, …) in
+         result.json. They appear twice (job-level `stats` and trial-level
+         `agent_result`) with identical values, so take the per-key maximum rather than
+         summing.
+      2. Summed per-turn `usage` blocks from the agent transcript. Several agents write
+         the same trajectory under two names, so again take the per-key maximum across
+         files.
+    """
+    canonical: dict[str, float] = {}
+    for p in sorted(outdir.rglob("result.json")):
+        data = _load_json(p)
+        if data is None:
+            continue
+
+        def scan(node: object) -> None:
+            if isinstance(node, dict):
+                if "n_input_tokens" in node:
+                    for k, v in node.items():
+                        if (k.startswith("n_") and k.endswith("tokens")
+                                and isinstance(v, (int, float))):
+                            canonical[k[2:]] = max(canonical.get(k[2:], 0), v)
+                for v in node.values():
+                    scan(v)
+            elif isinstance(node, list):
+                for v in node:
+                    scan(v)
+
+        scan(data)
+    if canonical:
+        return canonical
+
+    per_file: list[dict[str, float]] = []
+    for p in sorted({*outdir.rglob("*trajectory.json"), *outdir.rglob("transcript.json")}):
+        data = _load_json(p)
+        if data is None:
+            continue
+        totals = _sum_usage_blocks(data)
+        if totals:
+            per_file.append(totals)
+    if not per_file:
+        return None
+    merged: dict[str, float] = {}
+    for totals in per_file:
+        for k, v in totals.items():
+            merged[k] = max(merged.get(k, 0), v)
+    return merged
+
+
+def exception_summary(path: Path, limit: int = 300) -> str:
+    """Pick the actionable line out of an engine traceback file.
+
+    The last line is often `stderr: None`; the useful text is the exception class line
+    (for a real traceback) or a `stdout: Error: ...` line appended by harbor/pier.
+    """
+    try:
+        lines = [ln.strip() for ln in path.read_text(errors="replace").splitlines()]
+    except OSError:
+        return "trial failed"
+    for ln in reversed(lines):
+        if ln.startswith(("stdout:", "stderr:")) and "error" in ln.lower():
+            return ln[:limit]
+    for ln in reversed(lines):
+        if re.match(r"^[A-Za-z_][\w.]*(?:Error|Exception|Timeout)\b", ln):
+            return ln[:limit]
+    for ln in reversed(lines):
+        if "Error:" in ln:
+            return ln[:limit]
+    return (lines[-1] if lines else "trial failed")[:limit]
+
+
+def run_preconditions(cfg: dict, harness: str, provider: str) -> list[str]:
+    """Check only what this specific trial needs.
+
+    A missing `pier` must not block a TB4 run, and `oracle` needs no bundle, no
+    adapters and no API key. Returns a list of human-readable failures.
+    """
+    problems: list[str] = []
+
+    rc, out = _run(["docker", "info", "--format", "{{.ServerVersion}}"])
+    if rc != 0:
+        problems.append("docker: " + (out.splitlines()[-1][:90] if out else "unavailable"))
+
+    engine = cfg.get("engine")
+    binary = {"harbor": "harbor", "pier": "pier", "host": None}.get(engine)
+    if binary:
+        rc, out = _run([binary, "--version"])
+        if rc != 0:
+            problems.append(f"{engine}: `{binary}` not runnable (ASK-4)")
+
+    if not task_dirs(cfg):
+        problems.append(f"dataset: no tasks at {dataset_dir(cfg)}/tasks (ASK-3)")
+
+    # Disk policy is accepted batching: refuse to start a trial below the reserve so it
+    # cannot die mid-run on a full filesystem.
+    hc = host_config()
+    if hc:
+        free = disk_free_mb(docker_root(hc))
+        reserve = disk_reserve_mb(hc)
+        if 0 <= free < reserve:
+            problems.append(
+                f"disk: {free / 1024:.0f} GiB free on {docker_root(hc)} < "
+                f"{reserve / 1024:.0f} GiB reserve — run `docker image prune -a` and "
+                "`docker builder prune -af`"
+            )
+
+    # Every non-oracle harness calls a provider, so the key is needed in all of them.
+    if harness != "oracle":
+        p = providers().get(provider) or {}
+        auth_env = p.get("auth_env")
+        if not auth_env:
+            problems.append(f"provider {provider!r} has no auth_env")
+        else:
+            val = read_env_file().get(auth_env, "") or os.environ.get(auth_env, "")
+            if val in STUB_VALUES:
+                problems.append(f"key {auth_env} is a stub/empty in .env (ASK-2)")
+        if engine == "pier" and harness == "mini-swe-agent" and not (p.get("litellm") or {}).get("prefix"):
+            problems.append(f"provider {provider!r} has no litellm.prefix for mini-swe-agent")
+
+    # Only our own harbor adapter installs from the offline bundle. `pi-builtin` uses
+    # harbor's stock agent (npm at build time), so it must not require it.
+    if harness == "pi":
+        b = ROOT / "harness/bundle"
+        missing = [f for f in ("install.sh", "node-linux-x64.tar.gz", "pi-agent.tar.gz")
+                   if not (b / f).is_file()]
+        if missing:
+            problems.append("bundle: missing " + ", ".join(missing) + " (ASK-4)")
+        import_path = (cfg.get("agent") or {}).get("import_path", "")
+        module = import_path.split(":")[0].replace(".", "/")
+        if not module or not (ROOT / (module + ".py")).is_file():
+            problems.append(f"adapters: missing {module or '<import_path>'}.py")
+
+    return problems
+
+
+def cmd_run(args) -> int:
+    cfg = load_benchmark(args.bench)
+    if not cfg.get("enabled", False):
+        die(f"{args.bench} is disabled in benchmarks/{args.bench}/benchmark.yaml")
+    if not args.tasks:
+        die("--tasks is required (no implicit 'all')")
+
+    harness = args.harness
+    if harness not in ("pi", "pi-builtin", "mini-swe-agent", "oracle"):
+        die(f"unknown harness {harness!r} "
+            "(expected pi|pi-builtin|mini-swe-agent|oracle)")
+
+    if args.model:
+        model_key, model = resolve_model(args.model)
+    elif harness == "oracle":
+        model_key, model = "reference", {"provider": "none", "id": "none"}
+    else:
+        die(f"--model is required for --harness {harness}")
+    provider = model["provider"]
+    if harness == "oracle":
+        print("oracle harness: reference solution, no LLM, no API key, no model calls")
+        print("  (the trial dir name only records which model this run would be compared against)")
+
+    # precondition: only what this trial actually needs (see run_preconditions).
+    problems = run_preconditions(cfg, harness, provider)
+    if args.dry_run:
+        # A dry run contacts nothing, so a stub credential is not a blocker — but say so.
+        stubs = [p for p in problems if p.startswith("key ")]
+        if stubs:
+            print("NOTE: --dry-run does not contact any provider; "
+                  + "; ".join(stubs), file=sys.stderr)
+        problems = [p for p in problems if not p.startswith("key ")]
+    if problems:
+        for p in problems:
+            print(f"  blocked: {p}", file=sys.stderr)
+        die("refusing to start: preconditions not met")
+
+    api_key = ""
+    if harness != "oracle":
+        auth_env = providers()[provider].get("auth_env")
+        if not auth_env:
+            die(f"provider {provider!r} has no auth_env in config/providers.yaml")
+        api_key = read_env_file().get(auth_env, "") or os.environ.get(auth_env, "")
+        if api_key in STUB_VALUES:
+            if args.dry_run:
+                api_key = ""
+            else:
+                die(f"{auth_env} is still a stub/empty in .env — fill it (ASK-2) "
+                    f"before running {harness}")
+
+    tasks = parse_tasks(args.tasks, cfg, args.n_tasks, args.seed)
+    if not tasks:
+        die("no tasks selected")
+    if len(tasks) > 1 and not args.yes:
+        die(f"selected {len(tasks)} tasks ({', '.join(tasks)}); pass --yes to run more than one")
+
+    hc = host_config()
+    versions = bundle_versions()
+    pi_version = ""
+    node_version = ""
+    if harness == "pi":
+        # Container pi comes from the bundle; the host binary is not what runs.
+        pi_version = versions.get("pi") or "unknown"
+    elif harness == "pi-builtin":
+        rc, out = _run(["bash", "-lc", "pi --version"])
+        pi_version = out.splitlines()[0] if rc == 0 and out else "unknown"
+    if versions.get("node"):
+        node_version = "v" + versions["node"].lstrip("v")
+    else:
+        node_version = (_run(["node", "-v"])[1] or "") if shutil.which("node") else ""
+    disk_free = disk_free_mb(docker_root(hc)) if hc else -1
+
+    results = []
+    for task in tasks:
+        outdir = trial_dir(args.bench, model_key, harness, task)
+        if args.dry_run:
+            # Nothing is executed and nothing is written: a dry run must not create a
+            # trial directory that later shows up in `bench score`.
+            print(f"[{args.bench}/{model_key}/{harness}] {task}")
+            cmd = engine_command(cfg, harness, model_key, model, task, outdir,
+                                 agent_kwargs=args.agent_kwarg)
+            print(f"  would run: {shlex.join(cmd)}")
+            results.append((task, "dry-run", None))
+            continue
+        outdir.mkdir(parents=True, exist_ok=False)
+        log_path = LOGS / args.bench / f"{outdir.name}.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+
+        record = {
+            "bench": args.bench,
+            "bench_version": str(cfg.get("version", "")),
+            "dataset_ref": dataset_ref(cfg),
+            "model_key": model_key,
+            "provider": provider,
+            "model_id": model["id"],
+            "harness": harness,
+            "pi_version": pi_version,
+            "node_version": node_version,
+            "host": hc.get("name", ""),
+            "task_id": task,
+            "started_at": now_iso(),
+            "limits": {
+                "agent_timeout_sec": int((cfg.get("run") or {}).get("agent_timeout_sec", 10800)),
+                "trial_timeout_sec": int(args.timeout),
+            },
+            "disk_free_mb": disk_free,
+            "status": "running",
+            "usage": None,
+            "cost_usd": None,
+            "reward": None,
+        }
+        write_json(outdir / "run.json", record)
+
+        cmd = engine_command(cfg, harness, model_key, model, task, outdir,
+                             agent_kwargs=args.agent_kwarg)
+        extra_env = {}
+        if harness != "oracle" and cfg.get("engine") == "pier":
+            _, extra_env = litellm_target(provider, model["id"])
+            if api_key:
+                pcfg = providers()[provider].get("litellm") or {}
+                extra_env[pcfg.get("api_key_env", "OPENAI_API_KEY")] = api_key
+        env = trial_env(provider, api_key, extra_env)
+        print(f"[{args.bench}/{model_key}/{harness}] {task}")
+        print(f"  dir: {outdir.relative_to(ROOT)}")
+        print(f"  log: {log_path.relative_to(ROOT)}")
+        print(f"  cmd: {shlex.join(cmd)}")
+
+        t0 = time.time()
+        with log_path.open("w") as log:
+            log.write(shlex.join(cmd) + "\n\n")
+            log.flush()
+            try:
+                proc = subprocess.run(cmd, cwd=outdir, env=env,
+                                      stdout=log, stderr=subprocess.STDOUT,
+                                      timeout=args.timeout)
+                rc = proc.returncode
+            except subprocess.TimeoutExpired:
+                rc = 124
+            except FileNotFoundError:
+                rc = 127
+        elapsed = round(time.time() - t0, 1)
+
+        reward, _raw = collect_reward(outdir)
+        usage = collect_usage(outdir)
+        # Engines can exit 0 while a trial failed (pier does). Trust the trial's own
+        # exception record over the process exit code.
+        exceptions = sorted(outdir.rglob("exception.txt"))
+        if exceptions:
+            record["error"] = exception_summary(exceptions[0])
+        status = "ok"
+        if rc != 0:
+            status = f"error(rc={rc})"
+        elif exceptions:
+            status = "error(trial)"
+        record.update(
+            {
+                "finished_at": now_iso(),
+                "duration_sec": elapsed,
+                "status": status,
+                "exit_code": rc,
+                "usage": usage,
+                "cost_usd": None,
+                "reward": reward,
+            }
+        )
+        write_json(outdir / "run.json", record)
+        results.append((task, record["status"], reward))
+        print(f"  -> {record['status']}  reward={reward}  {elapsed}s")
+
+    print("\nsummary:")
+    for task, status, reward in results:
+        print(f"  {task:<40} {status:<12} reward={reward}")
+    return 0 if all(s in ("ok", "dry-run") for _, s, _ in results) else 1
+
+
+# --------------------------------------------------------------------------- score
+
+
+def cmd_score(args) -> int:
+    rows = []
+    for run_json in sorted(RUNS.rglob("run.json")):
+        try:
+            rec = json.loads(run_json.read_text())
+        except (json.JSONDecodeError, OSError):
+            continue
+        if args.bench and rec.get("bench") != args.bench:
+            continue
+        usage = rec.get("usage") or {}
+        rows.append(
+            {
+                "bench": rec.get("bench", ""),
+                "model_key": rec.get("model_key", ""),
+                "harness": rec.get("harness", ""),
+                "task_id": rec.get("task_id", ""),
+                "status": rec.get("status", ""),
+                "reward": "" if rec.get("reward") is None else rec.get("reward"),
+                "duration_sec": rec.get("duration_sec", ""),
+                "input_tokens": usage.get("input_tokens", ""),
+                "cache_tokens": usage.get("cache_tokens", ""),
+                "output_tokens": usage.get("output_tokens", ""),
+                "started_at": rec.get("started_at", ""),
+                "error": (rec.get("error") or "")[:160],
+                "run_dir": str(run_json.parent.relative_to(ROOT)),
+            }
+        )
+    out = RUNS / "_index.csv"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    fields = ["bench", "model_key", "harness", "task_id", "status", "reward",
+              "duration_sec", "input_tokens", "cache_tokens", "output_tokens",
+              "started_at", "error", "run_dir"]
+    with out.open("w", newline="") as fh:
+        w = csv.DictWriter(fh, fieldnames=fields)
+        w.writeheader()
+        w.writerows(rows)
+    print(f"wrote {out.relative_to(ROOT)} ({len(rows)} runs)")
+    return 0
+
+
+# --------------------------------------------------------------------------- main
+
+
+def main(argv: list[str] | None = None) -> int:
+    p = argparse.ArgumentParser(prog="bench", description=__doc__.splitlines()[0])
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    sub.add_parser("render", help="generate models.json from config/models.yaml").set_defaults(
+        fn=cmd_render)
+
+    d = sub.add_parser("doctor", help="check the environment")
+    d.add_argument("--full", action="store_true", help="also run scripts/verify-bundle.sh in docker")
+    d.set_defaults(fn=cmd_doctor)
+
+    sub.add_parser("list", help="list benchmarks and task counts").set_defaults(fn=cmd_list)
+
+    r = sub.add_parser("run", help="run tasks on one benchmark")
+    r.add_argument("bench")
+    r.add_argument("--model", default=None,
+                   help="model key or alias from config/models.yaml (optional for --harness oracle)")
+    r.add_argument("--harness", default="pi",
+                   choices=["pi", "pi-builtin", "mini-swe-agent", "oracle"])
+    r.add_argument("--tasks", required=True, help="task name, comma list, or random:N")
+    r.add_argument("-n", "--n-tasks", type=int, default=None, help="cap the number of tasks")
+    r.add_argument("--seed", type=int, default=0, help="seed for random:N")
+    r.add_argument("--timeout", type=int, default=4 * 60 * 60,
+                   help="wall-clock seconds for the whole trial process (default 14400)")
+    r.add_argument("--dry-run", action="store_true",
+                   help="print the commands that would run; no files, no containers")
+    r.add_argument("--yes", action="store_true", help="allow more than one task")
+    r.add_argument("--ak", "--agent-kwarg", dest="agent_kwarg", action="append",
+                   default=[], metavar="KEY=VALUE",
+                   help="extra agent kwarg passed to the engine (repeatable)")
+    r.set_defaults(fn=cmd_run)
+
+    s = sub.add_parser("score", help="index runs into runs/_index.csv")
+    s.add_argument("bench", nargs="?")
+    s.set_defaults(fn=cmd_score)
+
+    args = p.parse_args(argv)
+    return args.fn(args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

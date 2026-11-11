@@ -1,0 +1,21 @@
+name: deepswe
+enabled: true
+version: "v1.1"
+
+dataset:
+  path: datasets/deepswe
+  # Overridden at run time by datasets/deepswe.REVISION (40-char commit sha).
+  ref: ""
+
+engine: pier             # pier run -p datasets/deepswe/tasks --include-task-name <task>
+task_count: 113
+
+agent:
+  # pier runs its own agents; the --harness flag picks mini-swe-agent or oracle.
+  import_path: ""
+  # DeepSWE tasks declare [agent] network_mode = "no-network". The harness must
+  # install offline AND declare the provider host in its network allowlist.
+  network_mode: no-network
+
+run:
+  agent_timeout_sec: 10800

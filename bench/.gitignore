@@ -1,0 +1,26 @@
+# Secrets and machine-local state — never commit.
+.env
+
+# Generated / user-supplied / bulky.
+runs/
+logs/
+work/
+datasets/
+harness/bundle/
+*.tar.gz
+*.tar.xz
+*.tar.bz2
+*.zip
+
+# Python / tooling noise.
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# OS noise.
+.DS_Store
+*~

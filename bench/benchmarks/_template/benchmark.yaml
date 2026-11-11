@@ -1,0 +1,32 @@
+# Copy this directory to benchmarks/<name>/ and edit the fields.
+# Benchmarks are data-driven: bin/bench reads this file and the matching entry
+# in config/benchmarks.yaml. Do not add a `case` arm for a new benchmark.
+
+name: _template
+enabled: false
+
+# Version string recorded in every run.json as bench_version.
+version: ""
+
+dataset:
+  # Path relative to $BENCH_ROOT. User-supplied; never committed.
+  path: datasets/_template
+  # Pinned revision recorded in run.json as dataset_ref.
+  # For git-backed datasets, prefer the contents of datasets/<name>.REVISION.
+  ref: ""
+
+# Engine that executes the tasks. One of: harbor | pier | host.
+engine: harbor
+
+task_count: 0
+
+agent:
+  # Python import path of the pi adapter module:attribute.
+  # Ignored for the `oracle` harness (reference solution, no LLM).
+  import_path: harness.adapters.harbor_pi:Pi
+  # default | no-network
+  network_mode: default
+
+run:
+  # Wall-clock limit for the agent phase, recorded in run.json.limits.
+  agent_timeout_sec: 10800

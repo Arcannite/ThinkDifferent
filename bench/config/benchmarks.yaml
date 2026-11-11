@@ -1,0 +1,4 @@
+benchmarks:
+  - terminalbench4
+  - deepswe
+  - gdpval-aa

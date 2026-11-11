@@ -1,0 +1,17 @@
+name: gdpval-aa
+enabled: false           # scaffold only; no Docker required
+version: ""
+
+dataset:
+  path: datasets/gdpval-aa
+  ref: ""
+
+engine: host             # local runner via harness/adapters/host_pi.py
+task_count: 0
+
+agent:
+  import_path: harness.adapters.host_pi:Pi
+  network_mode: default
+
+run:
+  agent_timeout_sec: 10800

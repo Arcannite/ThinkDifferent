@@ -1,0 +1,22 @@
+# Secrets (bench/.gitignore only covers bench/)
+.env
+.env.*
+**/auth.json
+**/.netrc
+**/.npmrc
+*.pem
+*.key
+id_rsa*
+
+# OS/editor noise
+.DS_Store
+*~
+*.swp
+__pycache__/
+*.py[cod]
+
+# Framework clone: its own repo; track a lockfile instead
+backend/
+
+# Personal scratch note
+readme_draft

@@ -1,0 +1,50 @@
+providers:
+  ollama-cloud:
+    base_url: https://ollama.com/v1
+    api: openai-completions
+    auth_env: OLLAMA_API_KEY
+    builtin: false
+    egress: direct
+    litellm:
+      prefix: openai
+      api_key_env: OPENAI_API_KEY
+      base_url_env: OPENAI_API_BASE
+  opencode-go:
+    base_url: https://opencode.ai/zen/go/v1
+    api: openai-responses
+    auth_env: OPENCODE_API_KEY
+    builtin: true
+    egress: direct
+    litellm:
+      prefix: openai
+      api_key_env: OPENAI_API_KEY
+      base_url_env: OPENAI_API_BASE
+  qianwen:
+    base_url: https://maas.qianwenaiapi.com/compatible-mode/v1
+    api: openai-completions
+    auth_env: QWEN_API_KEY
+    builtin: false
+    egress: direct
+    litellm:
+      prefix: openai
+      api_key_env: OPENAI_API_KEY
+      base_url_env: OPENAI_API_BASE
+  qwen-token-plan-cn:
+    base_url: https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1
+    api: openai-completions
+    auth_env: QWEN_TOKEN_PLAN_CN_API_KEY
+    builtin: true
+    egress: direct
+    litellm:
+      prefix: openai
+      api_key_env: OPENAI_API_KEY
+      base_url_env: OPENAI_API_BASE
+  openrouter:
+    base_url: https://openrouter.ai/api/v1
+    api: openai-completions
+    auth_env: OPENROUTER_API_KEY
+    builtin: true
+    egress: direct
+    litellm:
+      prefix: openrouter
+      api_key_env: OPENROUTER_API_KEY

@@ -1,0 +1,17 @@
+name: terminalbench4
+enabled: true
+version: "4.0.0"
+
+dataset:
+  path: datasets/terminalbench4
+  ref: "v4.0.0"          # HuggingFace harborframework/terminal-bench @ v4.0.0
+
+engine: harbor           # harbor run -p datasets/terminalbench4/tasks --include-task-name <task>
+task_count: 66
+
+agent:
+  import_path: harness.adapters.harbor_pi:Pi
+  network_mode: default  # TB4 imposes no no-network restriction
+
+run:
+  agent_timeout_sec: 10800

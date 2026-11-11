@@ -1,0 +1,25 @@
+name: linux-box
+updated: "2026-11-04"                # last time the measurements below were taken
+paths:
+  datasets: /home/arcannite/sunfaded/bench/datasets
+  runs: /home/arcannite/sunfaded/bench/runs
+  docker_root: /var/lib/docker      # from `docker info`
+capacity:                            # from `docker info` + live df; bench re-checks disk
+  cpus: 20                          # nproc
+  mem_mb: 76105                     # MemTotal/1MiB (80201) minus 4096
+  disk_mb: 149504                   # measured 2026-11-04: 251904 MiB free − 102400 MiB
+                                    # reserve. Informational only: bin/bench calls
+                                    # shutil.disk_usage() before every trial.
+limits:
+  mem_headroom_mb: 4096
+  disk_reserve_gb: 100
+docker:
+  platform: ""                      # native linux/amd64: leave empty
+proxy:
+  url: ""                           # same value as PI_PROXY_URL, or empty
+# Local HTTP proxy used for host-side downloads only (git / hf / uv).
+# Provider egress (ollama.com, openrouter.ai, pypi, npm) is direct and unproxied.
+host_proxy: http://127.0.0.1:7897
+# Disk policy: accepted batching. TB4 fits whole; DeepSWE runs as disjoint
+# batches with `docker image prune -a` + `docker builder prune -af` between them.
+disk_policy: batch_and_prune
