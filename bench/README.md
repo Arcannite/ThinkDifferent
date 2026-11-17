@@ -33,7 +33,10 @@ benchmarks/<name>/         per-benchmark manifest (engine, dataset path, task co
 datasets/                  USER-SUPPLIED, gitignored (scripts/fetch-datasets.sh)
 harness/bundle/            offline pi install, built by scripts/build-bundle.sh, gitignored
 harness/adapters/          harbor_pi.py (copy+patch of harbor's pi agent) and registry.py
-scripts/                   bundle build/verify, dataset fetch/verify, docker proxy helper
+harness/fstrack/           git filesystem journal (fstrackd.py + install.sh)
+harness/pi/extensions/     pi extensions (fstrack.ts: turn/tool event markers)
+scripts/                   bundle build/verify, dataset fetch/verify, fstrack smoke test,
+                           docker proxy helper
 runs/                      ALL results (gitignored)
 logs/  work/               scratch (gitignored)
 ```
@@ -51,6 +54,7 @@ bench run terminalbench4 --model glm-5.3 --harness oracle --tasks atrx-vep-crisp
 bench run deepswe --model glm-5.3 --harness mini-swe-agent --tasks abs-module-cache-flags \
   --ak 'extra_python_packages=["mcp"]'
 bench score && column -s, -t runs/_index.csv | head
+bench track runs/terminalbench4/<model>/<trial>   # show the filesystem journal
 ```
 
 `--harness oracle` needs no `--model` (the directory records `reference`). DeepSWE's
@@ -87,6 +91,94 @@ directory of its own (`<trial>/2026-11-04__11-53-33/<task>/...`), so DeepSWE's
 `bench score` flattens every `run.json` into `runs/_index.csv` (reward, duration,
 token totals, error summary).
 
+### Filesystem journal (`fstrack`)
+
+When `--harness pi` is used and `benchmarks/<name>/benchmark.yaml` has
+`fstrack.enabled: true`, the adapter installs a small daemon and a pi extension into
+the task container. The daemon keeps an **independent** bare git repo per tracked
+root (`/app` by default) with its own `GIT_DIR`/`GIT_INDEX_FILE`; the task's own
+`.git` is never touched. It commits:
+
+* at every `tool_result` that changed files (trailers: tool, toolCallId, turn,
+  sessionId, leafId);
+* at every `turn_end` (empty marker commit, tagged `fstrack/turn-NNNN`);
+* on a periodic scan (`fstrack.scan_interval_sec`) for changes made by compilers,
+  tests or background jobs that never went through a tool call;
+* at start (`fstrack/base`) and at shutdown (`fstrack/final`).
+
+The repo is written to `/logs/artifacts/fstrack`, which the engine already collects:
+
+```
+<outdir>/<ts>/<trial>/artifacts/logs/artifacts/fstrack/
+├── summary.json       # policy, base/head per root, counts, repo_kb, over_cap
+├── index.jsonl        # one line per commit (trigger, event, changed files)
+├── events.jsonl       # pi turn/tool markers
+├── daemon.log
+├── app.large.jsonl    # large-file manifest (metadata only)
+└── app.git/           # bare repo; `git --git-dir=... log --decorate`
+```
+
+`run.json.fstrack` records the summary plus host-usable `gitdir_host` paths.
+`bench track <run>` prints the policy, journal state and recent commits. Replay/diff:
+
+```bash
+F=$(find runs/<...> -type d -name fstrack | head -1)
+git --git-dir=$F/app.git diff fstrack/base fstrack/final
+git --git-dir=$F/app.git show fstrack/turn-0017
+```
+
+#### Large files and safety guardrails
+
+The journal must never break a trial, so it does **not** blindly `git add -A .`:
+
+* **`max_file_mb` (default 8)** — regular files larger than this are never stored
+  in git. `large_file_mode` decides what happens:
+  * `manifest` (default): append `{path, size, mtime_ns, ctime_ns, mode}` to
+    `<slug>.large.jsonl`. The journal can say *when* and *that* a large file
+    changed, without storing the bytes. The final artifact collection still has the
+    final file for the verifier.
+  * `skip`: ignore large files entirely.
+  * `full`: store them anyway (old behaviour; only for small repos — a 10 GiB video
+    changed 10 times is ~100 GiB of git objects).
+* **`max_repo_mb` (default 256)** — circuit breaker. If the current candidate tree
+  or the git repo exceeds this, content commits stop. Empty `turn_end` markers and
+  the large-file manifest continue, so the timeline is preserved without further
+  disk growth. Set `0` to disable.
+* **Non-regular files** (FIFOs, sockets, devices) are never handed to git. This
+  avoids `git add` hanging on a named pipe.
+* **Explicit pathspec list** — the daemon stages `candidate files ∪ tracked files`
+  via `git add -A --pathspec-from-file`, not the whole tree. Excluded, large and
+  non-regular files are never read by git.
+* **Stale lock handling / backoff** — a failed or timed-out git command clears a
+  stale `index.lock` and backs off (exponential, capped at 60 s) instead of
+  retrying every scan. `git_timeout_sec` caps a single git call (default 120).
+* **`hash_large_files` (default false)** — when true, large-file manifest entries
+  include a full SHA-256. This reads the whole file, so it is opt-in.
+
+Default excludes already cover bulk media, disk images, archives, SQLite/DB files
+and model weights, in addition to VCS/cache/build directories. Add task-specific
+patterns with `exclude`.
+
+Configure per benchmark:
+
+```yaml
+fstrack:
+  enabled: true
+  roots: ["/app"]
+  scan_interval_sec: 1.0
+  max_file_mb: 8
+  large_file_mode: manifest   # skip | manifest | full
+  max_repo_mb: 256            # 0 disables the circuit breaker
+  hash_large_files: false
+  git_timeout_sec: 120
+  exclude: []                 # extra names/globs, e.g. ["target", "vendor"]
+```
+
+`scripts/verify-fstrack.sh` runs the daemon against a throwaway tree (no docker, no
+model) and checks: normal commits, exclusions, FIFO handling, the large-file
+manifest (including `hash_large_files`), the `max_repo_mb` breaker, `full` mode and
+`skip` mode.
+
 ## `bench run` semantics
 
 - `--tasks` is **required**; there is no implicit "all". `random:N` is supported and
@@ -98,6 +190,8 @@ token totals, error summary).
   environment is not inherited.
 - `--dry-run` prints the engine command for each selected task. It writes nothing and
   starts nothing, so nothing appears in `bench score`.
+- `--harness pi` also starts `fstrack` when the benchmark enables it; the journal is
+  collected with the trial and summarized in `run.json.fstrack`.
 - `--timeout` caps the whole trial process (default 14400 s). The task manifest's
   `agent_timeout_sec` is recorded separately in `run.json.limits`.
 - `--ak KEY=VALUE` is forwarded to the engine as `--ak` (repeatable); needed for

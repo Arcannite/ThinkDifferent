@@ -15,3 +15,24 @@ agent:
 
 run:
   agent_timeout_sec: 10800
+
+# Filesystem journal (harness/fstrack). The pi adapter installs git + fstrackd
+# and a pi extension, then records a git commit at every tool/turn boundary
+# and on a periodic scan. The repo is collected at
+# <trial>/artifacts/logs/artifacts/fstrack/.
+fstrack:
+  enabled: true
+  roots: ["/app"]
+  scan_interval_sec: 1.0
+  # Large-file policy. Files over max_file_mb are not stored in git:
+  #   manifest -> metadata in <slug>.large.jsonl (default)
+  #   skip     -> ignore them entirely
+  #   full     -> store them anyway (only for small repos)
+  max_file_mb: 8
+  large_file_mode: manifest
+  # Circuit breaker. When the tree or repo exceeds this, content commits stop;
+  # empty turn markers and the large-file manifest continue. 0 disables.
+  max_repo_mb: 256
+  hash_large_files: false   # true = sha256 every large file (slow)
+  git_timeout_sec: 120
+  exclude: []               # extra names/globs, e.g. ["target", "dist"]

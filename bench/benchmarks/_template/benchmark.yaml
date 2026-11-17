@@ -30,3 +30,16 @@ agent:
 run:
   # Wall-clock limit for the agent phase, recorded in run.json.limits.
   agent_timeout_sec: 10800
+
+# Filesystem journal (optional). The pi adapter installs git + fstrackd and
+# records a git commit per tool/turn boundary plus a periodic scan.
+fstrack:
+  enabled: false
+  roots: ["/app"]
+  scan_interval_sec: 1.0
+  max_file_mb: 8
+  large_file_mode: manifest   # skip | manifest | full
+  max_repo_mb: 256            # 0 disables the circuit breaker
+  hash_large_files: false
+  git_timeout_sec: 120
+  exclude: []

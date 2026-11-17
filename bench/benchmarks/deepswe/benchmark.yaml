@@ -19,3 +19,17 @@ agent:
 
 run:
   agent_timeout_sec: 10800
+
+# Filesystem journal is wired into the pi adapter only (harbor/TB4). DeepSWE
+# currently runs pier's mini-swe-agent, so fstrack is stage-2 here: it needs a
+# pier agent wrapper (or pier_pi.py) to install/start the daemon.
+fstrack:
+  enabled: false
+  roots: ["/app"]
+  scan_interval_sec: 1.0
+  max_file_mb: 8
+  large_file_mode: manifest
+  max_repo_mb: 256
+  hash_large_files: false
+  git_timeout_sec: 120
+  exclude: []

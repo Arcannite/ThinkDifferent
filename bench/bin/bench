@@ -466,14 +466,26 @@ def bundle_dir() -> Path:
 
 
 def bundle_mounts() -> str:
-    """harbor --mounts: expose the offline bundle read-only inside the task container."""
+    """harbor --mounts: expose the offline bundle and fstrack read-only."""
     return json.dumps([
         {
             "type": "bind",
             "source": str(bundle_dir()),
             "target": "/opt/pi-bundle",
             "read_only": True,
-        }
+        },
+        {
+            "type": "bind",
+            "source": str(ROOT / "harness" / "fstrack"),
+            "target": "/opt/fstrack",
+            "read_only": True,
+        },
+        {
+            "type": "bind",
+            "source": str(ROOT / "harness" / "pi" / "extensions"),
+            "target": "/opt/pi-extensions",
+            "read_only": True,
+        },
     ])
 
 
@@ -566,6 +578,32 @@ def collect_reward(outdir: Path) -> tuple[float | None, dict | None]:
         if m:
             return float(m.group(0)), {"raw": txt}
     return None, None
+
+
+def collect_fstrack(outdir: Path) -> dict | None:
+    """Summarize the filesystem journal produced by harness/fstrack/fstrackd.py."""
+    candidates = sorted(outdir.rglob("fstrack/summary.json"))
+    if not candidates:
+        return None
+    try:
+        data = json.loads(candidates[0].read_text())
+    except (json.JSONDecodeError, OSError):
+        return None
+    base = candidates[0].parent
+    data["path"] = str(base.relative_to(ROOT))
+    # Container paths (/logs/...) are meaningless on the host. Record the
+    # collected git dir alongside them so analysis tools can use it directly.
+    out = str(data.get("out") or "")
+    for st in (data.get("roots") or {}).values():
+        gitdir = Path(st.get("gitdir", ""))
+        try:
+            rel = gitdir.relative_to(out) if out else Path(gitdir.name)
+        except ValueError:
+            rel = Path(gitdir.name)
+        host = base / rel
+        if host.exists():
+            st["gitdir_host"] = str(host.relative_to(ROOT))
+    return data
 
 
 def _load_json(p: Path) -> object | None:
@@ -858,6 +896,30 @@ def cmd_run(args) -> int:
                 pcfg = providers()[provider].get("litellm") or {}
                 extra_env[pcfg.get("api_key_env", "OPENAI_API_KEY")] = api_key
         env = trial_env(provider, api_key, extra_env)
+        fcfg = cfg.get("fstrack") or {}
+        if fcfg.get("enabled", True) and harness == "pi":
+            fstrack_mode = str(fcfg.get("large_file_mode", "manifest"))
+            if fstrack_mode not in ("skip", "manifest", "full"):
+                die(f"fstrack.large_file_mode must be skip|manifest|full, "
+                    f"got {fstrack_mode!r}")
+            for key, default in (("max_file_mb", 8), ("max_repo_mb", 256)):
+                try:
+                    value = float(fcfg.get(key, default))
+                except (TypeError, ValueError):
+                    die(f"fstrack.{key} must be a number, got {fcfg.get(key)!r}")
+                if value < 0:
+                    die(f"fstrack.{key} must be >= 0, got {value}")
+            env["BENCH_FSTRACK_ROOTS"] = ":".join(fcfg.get("roots") or ["/app"])
+            env["BENCH_FSTRACK_SCAN_INTERVAL"] = str(fcfg.get("scan_interval_sec", 1.0))
+            env["BENCH_FSTRACK_MAX_FILE_MB"] = str(fcfg.get("max_file_mb", 8))
+            env["BENCH_FSTRACK_LARGE_MODE"] = fstrack_mode
+            env["BENCH_FSTRACK_MAX_REPO_MB"] = str(fcfg.get("max_repo_mb", 256))
+            env["BENCH_FSTRACK_HASH_LARGE"] = (
+                "1" if fcfg.get("hash_large_files") else "0"
+            )
+            env["BENCH_FSTRACK_GIT_TIMEOUT"] = str(fcfg.get("git_timeout_sec", 120))
+            if fcfg.get("exclude"):
+                env["BENCH_FSTRACK_EXCLUDE"] = ":".join(fcfg["exclude"])
         print(f"[{args.bench}/{model_key}/{harness}] {task}")
         print(f"  dir: {outdir.relative_to(ROOT)}")
         print(f"  log: {log_path.relative_to(ROOT)}")
@@ -899,6 +961,7 @@ def cmd_run(args) -> int:
                 "usage": usage,
                 "cost_usd": None,
                 "reward": reward,
+                "fstrack": collect_fstrack(outdir),
             }
         )
         write_json(outdir / "run.json", record)
@@ -954,6 +1017,84 @@ def cmd_score(args) -> int:
     return 0
 
 
+# --------------------------------------------------------------------------- track
+
+
+def cmd_track(args) -> int:
+    base = Path(args.run)
+    if not base.is_absolute():
+        base = (ROOT / base).resolve()
+    if not base.exists():
+        die(f"no such path: {base}")
+
+    summaries = sorted(base.rglob("fstrack/summary.json"))
+    if not summaries and (base / "summary.json").exists():
+        summaries = [base / "summary.json"]
+    if not summaries:
+        die(f"no fstrack summary under {base} (was the trial run with --harness pi?)")
+
+    for summary_path in summaries:
+        try:
+            data = json.loads(summary_path.read_text())
+        except (json.JSONDecodeError, OSError) as exc:
+            print(f"cannot read {summary_path}: {exc}", file=sys.stderr)
+            continue
+        try:
+            where = summary_path.parent.relative_to(ROOT)
+        except ValueError:
+            where = summary_path.parent
+        print(f"fstrack: {where}")
+        print(f"  started:  {data.get('started_at')}")
+        print(f"  finished: {data.get('finished_at')}")
+        print(f"  events:   {data.get('events')}")
+        policy = data.get("policy") or {}
+        if policy:
+            print(
+                "  policy:   "
+                f"max_file_mb={policy.get('max_file_mb')} "
+                f"large_file_mode={policy.get('large_file_mode')} "
+                f"max_repo_mb={policy.get('max_repo_mb')} "
+                f"hash_large_files={policy.get('hash_large_files')}"
+            )
+        for root, st in (data.get("roots") or {}).items():
+            print(f"  root {root}")
+            print(f"    base={st.get('base')}  head={st.get('head')}  commits={st.get('commits')}")
+            print(
+                "    "
+                f"large_files={st.get('large_files', 0)} "
+                f"large_bytes={st.get('large_bytes', 0)} "
+                f"non_regular={st.get('non_regular', 0)} "
+                f"repo_kb={st.get('repo_kb', '?')} "
+                f"over_cap={st.get('over_cap', False)} "
+                f"failures={st.get('failures', 0)}"
+            )
+            if st.get("last_error"):
+                print(f"    last_error: {st['last_error']}")
+            gitdir = Path(st.get("gitdir_host") or st.get("gitdir", ""))
+            if st.get("gitdir_host"):
+                gitdir = (ROOT / gitdir).resolve()
+            if not gitdir.exists():
+                # The summary records container paths (/logs/...); the engine
+                # collected the same tree under this summary's directory.
+                out = str(data.get("out") or "/logs/artifacts/fstrack")
+                try:
+                    rel = gitdir.relative_to(out)
+                except ValueError:
+                    rel = Path(gitdir.name)
+                gitdir = summary_path.parent / rel
+            if not gitdir.exists():
+                print(f"    (git dir not collected: {gitdir})")
+                continue
+            p = subprocess.run(
+                ["git", f"--git-dir={gitdir}", "log", "--oneline", "--decorate",
+                 "-n", str(args.limit)],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+            )
+            for line in p.stdout.splitlines():
+                print(f"    {line}")
+    return 0
+
+
 # --------------------------------------------------------------------------- main
 
 
@@ -992,6 +1133,12 @@ def main(argv: list[str] | None = None) -> int:
     s = sub.add_parser("score", help="index runs into runs/_index.csv")
     s.add_argument("bench", nargs="?")
     s.set_defaults(fn=cmd_score)
+
+    t = sub.add_parser("track", help="show the fstrack journal for a run or trial dir")
+    t.add_argument("run", help="run/trial directory (or its fstrack directory)")
+    t.add_argument("-n", "--limit", type=int, default=20,
+                   help="commits to show per tracked root (default 20)")
+    t.set_defaults(fn=cmd_track)
 
     args = p.parse_args(argv)
     return args.fn(args)
