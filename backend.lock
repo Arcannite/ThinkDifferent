@@ -1,0 +1,17 @@
+# backend.lock — pinned state of the third-party framework clone in ./backend
+#
+# backend/ is a full independent git clone and is ignored by this repo.
+# This file is the only record of what it should contain, so keep it tracked.
+# Written by bin/backend; edit url/ref by hand, leave sha/updated to the tool.
+#
+# url     upstream (framework) repository URL
+# ref     upstream branch to merge from
+# sha     commit currently pinned / last merged into
+# updated last successful update (UTC)
+# fork    optional: your fork, used to back up local commits
+
+url=https://github.com/vllm-project/vllm
+ref=main
+sha=8657860cd37d2ba777851b5fe4e026828ded402f
+updated=2026-11-15T12:37:54Z
+fork=
